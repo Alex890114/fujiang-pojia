@@ -4,6 +4,8 @@ param(
   [string]$Profile = 'desktop',
   [string]$DshCommand = '',
   [string]$DshHome = '',
+  # Used by the double-click launcher; never prompts during a dry run.
+  [switch]$PromptForDshPath,
   # Only print the plan; change nothing.
   [switch]$DryRun
 )
@@ -26,6 +28,117 @@ function Get-HarnessProcesses {
   })
 }
 
+# Resolve a literal CLI path or a Desktop install directory without executing it.
+function Resolve-DshCandidate {
+  param([string]$Path, [switch]$AllowCommandFile)
+  if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+  $candidate = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+  if (Test-Path -LiteralPath $candidate -PathType Container) {
+    $root = $candidate
+  } elseif (Test-Path -LiteralPath $candidate -PathType Leaf) {
+    $root = Split-Path -Parent $candidate
+    $extension = [IO.Path]::GetExtension($candidate)
+    $name = [IO.Path]::GetFileNameWithoutExtension($candidate)
+    if ($AllowCommandFile -and ($extension -in @('.cmd', '.bat', '.ps1') -or ($extension -eq '.exe' -and $name -eq 'dsh'))) {
+      return (Get-Item -LiteralPath $candidate).FullName
+    }
+  } else {
+    return $null
+  }
+  $cli = Join-Path $root 'resources\runtime\cli\bin\dsh.cmd'
+  if (Test-Path -LiteralPath $cli -PathType Leaf) {
+    return (Get-Item -LiteralPath $cli).FullName
+  }
+  return $null
+}
+
+function Get-HarnessInstallLocations {
+  # Processes and registered locations work with custom drives and folder names.
+  foreach ($process in @(Get-HarnessProcesses)) {
+    if ($process.Path) { $process.Path }
+  }
+  foreach ($registryRoot in @(
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )) {
+    foreach ($entry in @(Get-ItemProperty -Path $registryRoot -ErrorAction SilentlyContinue)) {
+      if ($entry.DisplayName -notmatch '(?i)deepseek[\s-]*harness') { continue }
+      if ($entry.InstallLocation) { $entry.InstallLocation }
+      if ($entry.DisplayIcon) {
+        # DisplayIcon may be quoted and end in an icon index, e.g. "D:\Apps\Harness.exe",0.
+        ([string]$entry.DisplayIcon -replace ',\s*-?\d+\s*$', '').Trim().Trim('"')
+      }
+    }
+  }
+  foreach ($registryRoot in @(
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\*',
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\*',
+    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\*'
+  )) {
+    foreach ($entry in @(Get-ItemProperty -Path $registryRoot -ErrorAction SilentlyContinue)) {
+      $appPath = [string]$entry.'(default)'
+      if ($entry.PSChildName -match '(?i)deepseek[\s-]*harness' -or $appPath -match '(?i)deepseek[\s-]*harness') {
+        if ($appPath) { $appPath }
+      }
+    }
+  }
+  # Read known shortcut locations only; do not recursively search users' drives.
+  $shell = $null
+  try {
+    $shell = New-Object -ComObject WScript.Shell -ErrorAction Stop
+    foreach ($folderName in @('Programs', 'CommonPrograms', 'DesktopDirectory', 'CommonDesktopDirectory')) {
+      $shortcutRoot = [Environment]::GetFolderPath($folderName)
+      if (-not $shortcutRoot -or -not (Test-Path -LiteralPath $shortcutRoot -PathType Container)) { continue }
+      foreach ($shortcutFile in @(Get-ChildItem -LiteralPath $shortcutRoot -Filter '*harness*.lnk' -File -Recurse -ErrorAction SilentlyContinue)) {
+        $shortcut = $null
+        try {
+          $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
+          if ($shortcut.TargetPath) { $shortcut.TargetPath }
+        } catch { } finally {
+          if ($shortcut -and [Runtime.InteropServices.Marshal]::IsComObject($shortcut)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+          }
+        }
+      }
+    }
+  } catch { } finally {
+    if ($shell -and [Runtime.InteropServices.Marshal]::IsComObject($shell)) {
+      [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    }
+  }
+  # Registered/shortcut locations take precedence over leftover default installs.
+  foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if (-not [string]::IsNullOrWhiteSpace($base)) {
+      if ($base -eq $env:LOCALAPPDATA) { Join-Path $base 'Programs\DeepSeek Harness' }
+      else { Join-Path $base 'DeepSeek Harness' }
+    }
+  }
+}
+
+function Find-DshExecutable {
+  param([string]$Command = '')
+  if (-not [string]::IsNullOrWhiteSpace($Command)) {
+    $resolved = Resolve-DshCandidate -Path $Command -AllowCommandFile
+    if ($resolved) { return $resolved }
+    # An explicit path must not silently fall back to a different installation.
+    if ($Command -match '[/\\:]') { return $null }
+    $commandInfo = Get-Command -Name $Command -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($commandInfo) { return $commandInfo.Source }
+    return $null
+  }
+  $seen = @{}
+  foreach ($location in @(Get-HarnessInstallLocations)) {
+    if ([string]::IsNullOrWhiteSpace($location) -or $seen.ContainsKey($location)) { continue }
+    $seen[$location] = $true
+    $resolved = Resolve-DshCandidate -Path $location
+    if ($resolved) { return $resolved }
+  }
+  $commandInfo = Get-Command -Name 'dsh' -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($commandInfo) { return $commandInfo.Source }
+  return $null
+}
+
 if (-not (Test-Path -LiteralPath $sourcePlugin -PathType Container)) {
   throw 'The bundled plugin directory is missing.'
 }
@@ -42,23 +155,23 @@ if ([string]::IsNullOrWhiteSpace($DshHome)) {
 $targetHome = [System.IO.Path]::GetFullPath($targetHome)
 $env:DSH_HOME = $targetHome
 
-$dshExecutable = ''
-$desktopDsh = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd'
-if ([string]::IsNullOrWhiteSpace($DshCommand) -and (Test-Path -LiteralPath $desktopDsh -PathType Leaf)) {
-  $dshExecutable = $desktopDsh
-} else {
-  $commandName = if ([string]::IsNullOrWhiteSpace($DshCommand)) { 'dsh' } else { $DshCommand }
-  $dsh = Get-Command -Name $commandName -ErrorAction SilentlyContinue
-  if (-not $dsh) {
-    throw "DSH CLI '$commandName' was not found. Install the official DSH CLI or pass -DshCommand."
+$dshExecutable = Find-DshExecutable -Command $DshCommand
+if (-not $dshExecutable -and $PromptForDshPath -and -not $DryRun -and [string]::IsNullOrWhiteSpace($DshCommand)) {
+  Write-Step '未自动找到 DeepSeek Harness。请右键其快捷方式 → 打开文件所在的位置，复制安装文件夹路径。'
+  Write-Step '可输入安装文件夹、DeepSeek Harness.exe 或 dsh.cmd 的完整路径；直接回车取消。'
+  $enteredPath = Read-Host 'DeepSeek Harness 路径'
+  if (-not [string]::IsNullOrWhiteSpace($enteredPath)) {
+    $dshExecutable = Find-DshExecutable -Command $enteredPath
   }
-  $dshExecutable = if ($dsh.Source) { $dsh.Source } else { $dsh.Definition }
+}
+if (-not $dshExecutable) {
+  throw '未找到 DSH 命令行工具。可运行 .\install.ps1 -DshCommand "D:\应用\DeepSeek Harness"（替换为实际安装目录或 dsh.cmd 路径）。若数据目录也已移动，另传 -DshHome "D:\数据\.dsh"；请勿将程序安装目录当作数据目录。'
 }
 
 if ($Profile -eq 'desktop') {
   $desktopProfile = Join-Path $targetHome 'profiles\desktop'
   if (-not (Test-Path -LiteralPath (Join-Path $desktopProfile 'package.json') -PathType Leaf)) {
-    throw 'Start DeepSeek Harness Desktop once to initialize its desktop profile, then run this installer again.'
+    throw ('未找到 Desktop 配置：' + $desktopProfile + '。请先启动一次 DeepSeek Harness Desktop；若数据目录已移动，请使用 -DshHome 指定 .dsh 数据目录（不是程序安装目录）。')
   }
 }
 

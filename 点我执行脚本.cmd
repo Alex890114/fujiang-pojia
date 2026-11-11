@@ -7,7 +7,7 @@ echo   Close DeepSeek Harness first (tray icon - Exit),
 echo   then run this file again.
 echo ================================================
 echo.
-powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "%~dp0install.ps1" %*
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "%~dp0install.ps1" -PromptForDshPath %*
 set "rc=%ERRORLEVEL%"
 echo.
 pause
